@@ -348,6 +348,151 @@ mod tests {
     use super::*;
 
     #[test]
+    fn paginated_user_and_org_listings() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        for provider in ["github", "gitlab", "forgejo"] {
+            for organization in [false, true] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let origin = format!("http://{}", listener.local_addr().unwrap());
+                let source = Source {
+                    url: Url::parse(&format!("{origin}/alice")).unwrap(),
+                    namespace: "alice".into(),
+                    provider: provider.into(),
+                };
+                let org_path = if provider == "gitlab" {
+                    "/api/v4/groups/alice/projects"
+                } else if provider == "github" {
+                    "/api/v3/orgs/alice/repos"
+                } else {
+                    "/api/v1/orgs/alice/repos"
+                };
+                let user_path = match provider {
+                    "gitlab" => "/api/v4/users/42/projects",
+                    "github" => "/api/v3/users/alice/repos",
+                    _ => "/api/v1/users/alice/repos",
+                };
+                let mut replies = Vec::new();
+                if !organization {
+                    replies.push((org_path.to_owned(), 404, "{}".to_owned()));
+                    if provider == "gitlab" {
+                        replies.push((
+                            "/api/v4/users?username=alice".into(),
+                            200,
+                            "[{\"id\":42}]".into(),
+                        ));
+                    }
+                }
+                for page in 1..=3 {
+                    let path = if organization { org_path } else { user_path };
+                    let body = if page == 3 {
+                        "[]".into()
+                    } else {
+                        let (name_key, url_key) = if provider == "gitlab" {
+                            ("path_with_namespace", "http_url_to_repo")
+                        } else {
+                            ("full_name", "clone_url")
+                        };
+                        serde_json::json!([{name_key: format!("alice/repo{page}"), url_key: format!("{origin}/alice/repo{page}.git")}]).to_string()
+                    };
+                    replies.push((format!("{path}?page={page}"), 200, body));
+                }
+                let server = std::thread::spawn(move || {
+                    for (expected, status, body) in replies {
+                        let (mut stream, _) = listener.accept().unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let mut reader = BufReader::new(&mut stream);
+                        let mut request = String::new();
+                        reader.read_line(&mut request).unwrap();
+                        let target = request.split_whitespace().nth(1).unwrap();
+                        let actual = Url::parse(&format!("http://localhost{target}")).unwrap();
+                        let expected = Url::parse(&format!("http://localhost{expected}")).unwrap();
+                        assert_eq!(actual.path(), expected.path());
+                        for pair in expected.query_pairs() {
+                            assert!(actual.query_pairs().any(|actual| actual == pair));
+                        }
+                        loop {
+                            let mut header = String::new();
+                            reader.read_line(&mut header).unwrap();
+                            if header == "\r\n" {
+                                break;
+                            }
+                        }
+                        write!(stream, "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    }
+                });
+                let client = Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .unwrap();
+                let repos = repositories(&client, &source, None).unwrap();
+                assert_eq!(repos.len(), 2);
+                assert_eq!(repos[1].0, "alice/repo2");
+                server.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn clone_update_prune_and_refuse_unrelated_directory() {
+        let root = env::temp_dir().join(format!(
+            "host-repo-backup-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        git_output(&root, &["init", "--bare", "origin.git"]).unwrap();
+        let origin = root.join("origin.git");
+        let tree = git_output(&origin, &["mktree"]).unwrap();
+        let commit = git_output(
+            &origin,
+            &[
+                "-c",
+                "user.name=Backup Test",
+                "-c",
+                "user.email=backup@example.com",
+                "commit-tree",
+                &tree,
+                "-m",
+                "test",
+            ],
+        )
+        .unwrap();
+        git_output(&origin, &["update-ref", "refs/heads/main", &commit]).unwrap();
+        let mirror = root.join("mirror.git");
+        backup(&mirror, origin.to_str().unwrap()).unwrap();
+        assert_eq!(
+            git_output(&mirror, &["rev-parse", "refs/heads/main"]).unwrap(),
+            commit
+        );
+        git_output(&origin, &["update-ref", "refs/tags/v1", &commit]).unwrap();
+        backup(&mirror, origin.to_str().unwrap()).unwrap();
+        assert_eq!(
+            git_output(&mirror, &["rev-parse", "refs/tags/v1"]).unwrap(),
+            commit
+        );
+        git_output(&origin, &["update-ref", "-d", "refs/tags/v1"]).unwrap();
+        backup(&mirror, origin.to_str().unwrap()).unwrap();
+        assert!(git_output(&mirror, &["show-ref", "--verify", "refs/tags/v1"]).is_err());
+        assert!(backup(&mirror, "https://example.com/wrong.git").is_err());
+        let unrelated = root.join("unrelated");
+        fs::create_dir(&unrelated).unwrap();
+        fs::write(unrelated.join("keep.txt"), "keep").unwrap();
+        assert!(backup(&unrelated, origin.to_str().unwrap()).is_err());
+        assert_eq!(
+            fs::read_to_string(unrelated.join("keep.txt")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[test]
     fn source_and_destination_validation() {
         let github = Source::parse("github.com/alice", None).unwrap();
         assert_eq!(
